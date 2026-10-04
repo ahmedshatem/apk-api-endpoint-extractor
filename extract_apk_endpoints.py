@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
-"""Extract likely API endpoints from an Android APK - Enhanced Filtering.
+"""APK API Endpoint Extractor (Clean Version)
 
-This version filters out common false positives:
-- Binary/media files (.bin, .jpg, .mp4, etc.)
-- External bug trackers and docs
-- CDN and asset URLs
-- Known false patterns
-
-Output format:
-    POST https://api.example.com/login
+Purpose:
+- Extract real API endpoints from an APK
+- Keep only endpoints with real API-like structure
+- Ignore binaries, docs, random strings, and static asset URLs
+- Output in the format:
     GET https://api.example.com/v1/users
+    POST https://api.example.com/login
+
+Why this version is better:
+- Stricter filtering than generic regex extractors
+- Removes false positives like .bin, .png, docs, Facebook, random strings
+- Works well with apps like YouTube / large APKs
+
+Usage:
+    python3 extract_apk_endpoints.py app.apk
+    python3 extract_apk_endpoints.py app.apk --output endpoints.txt
+    python3 extract_apk_endpoints.py app.apk --no-jadx
 """
 
 from __future__ import annotations
@@ -25,121 +33,87 @@ import zipfile
 from collections import OrderedDict
 from urllib.parse import urlparse
 
+# --- Constants ---
 URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 PATH_RE = re.compile(
-    r"(?:/|https?://)[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+(?:/api|/v\d+|/graphql|/oauth|/auth|/login|/signup|/register|/users|/orders|/payments|/profile|/search|/mobile|/graphql)[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*",
+    r"(?:/|https?://)[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+(?:/api|/v\d+|/graphql|/oauth|/auth|/login|/signin|/signup|/register|/users|/profile|/account|/token|/refresh|/verify|/notifications|/search|/orders|/payment|/payments|/products|/comments|/posts|/feed|/messages|/upload|/download|/settings)[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*",
     re.IGNORECASE,
 )
 
-# Useful for method guessing from surrounding context in the decompiled source.
 METHOD_HINTS = {
-    "get": "GET",
-    "post": "POST",
-    "put": "PUT",
-    "patch": "PATCH",
-    "delete": "DELETE",
-    "update": "PUT",
-    "create": "POST",
     "login": "POST",
     "signin": "POST",
     "signup": "POST",
     "register": "POST",
-    "forgot": "POST",
-    "reset": "POST",
-    "verify": "POST",
-    "upload": "POST",
-    "download": "GET",
-    "logout": "POST",
+    "auth": "POST",
     "oauth": "POST",
     "token": "POST",
+    "verify": "POST",
+    "reset": "POST",
+    "update": "PUT",
+    "create": "POST",
+    "delete": "DELETE",
+    "upload": "POST",
+    "download": "GET",
     "search": "GET",
     "filter": "GET",
+    "query": "GET",
     "fetch": "GET",
-    "retrieve": "GET",
+    "get": "GET",
+    "list": "GET",
+    "orders": "GET",
+    "products": "GET",
+    "profile": "GET",
+    "settings": "GET",
+    "notifications": "GET",
+    "messages": "GET",
 }
 
-# File extensions that are NOT API endpoints
 SKIP_SUFFIXES = (
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ttf", ".otf",
     ".woff", ".woff2", ".eot", ".mp3", ".mp4", ".wav", ".ogg", ".bin",
     ".so", ".pem", ".cer", ".p12", ".zip", ".apk", ".dex", ".jar",
-    ".pdf", ".xml", ".json", ".txt", ".map", ".css", ".js", ".html",
-    ".ico", ".dat", ".db", ".sql", ".proto", ".pb", ".o", ".a",
+    ".pdf", ".map", ".css", ".js", ".html", ".xml", ".json", ".txt",
+    ".ico", ".dat", ".db", ".sqlite", ".proto", ".pb", ".wasm",
 )
 
-# Paths/domains to ignore (false positives, external links, etc.)
-IGNORE_KEYWORDS = (
-    "google-analytics",
-    "doubleclick",
-    "facebook.com/tr",
-    "fonts.googleapis",
-    "cdn-cgi",
-    "youtrack.jetbrains",
-    "github.com",
-    "gitlab.com",
-    "stackoverflow.com",
-    "sentry.io",
-    "rollbar.com",
-    "bugsnag.com",
-    "crashlytics",
-    "firebase",
-    "scheme",
-    "schema",
-    "w3.org",
-    "w3c.org",
-    "xmlns",
-    "model.bin",
-    "detector",
-    "tracker",
-    "features",
-    "pdm_multires",
-    "face_",
-    "tflite",
-    "onnx",
-    "pb.txt",
-    "_startup",
-    "_prop.txt",
-    "logcat",
-    "anr_",
-    "dump_state",
-    "cache/",
-    "assets/data",
-    "assets/boost",
-    "assets/fizz",
-    "assets/hero",
-    "assets/media",
-    "assets/lib",
-    "/system/",
-    "/proc/",
-    "/dev/",
-    "/.well-known",
-    "robots.txt",
-    "favicon.ico",
-    "apple-touch",
-    "manifest.json",
-    "openid-configuration",
-    "oauth2/v1",
-    "www.facebook.com",
-    "m.facebook.com",
-    "graph.facebook.com",
-    "graph.instagram.com",
-    "mqtt",
-    "telemetry",
-    "tracking",
-    "analytics",
-)
-
-# Paths that look like they contain version numbers but are NOT API endpoints
 FALSE_POSITIVE_PATTERNS = (
-    r"/v\d+[a-z_].*\.bin",  # /v14/face_detector_model.bin
+    r"/v\d+[a-z_].*\.bin",
     r"/v\d+[a-z_].*model",
-    r"[a-z_]*v\d+[a-z_]*\.(bin|dat|db|pb|proto|json|xml)",
-    r"/\w+_\w+/v\d+",  # Like /selfiecapture/v14
+    r"/assets/",
+    r"/cache/",
+    r"/system/",
+    r"/proc/",
+    r"/dev/",
+    r"/\.well-known/",
+    r"/google-analytics",
+    r"/doubleclick",
+    r"/favicon\.ico",
+    r"/robots\.txt",
+    r"facebook\.com",
+    r"instagram\.com",
+    r"youtube\.com/api/lounge",
+    r"youtubei\.googleapis\.com/generate_204",
+    r"google\.com/maps",
+    r"support\.google\.com",
+    r"docs\.google\.com",
+    r"docs\.microsoft\.com",
+    r"microsoft\.com",
+    r"www\.apache\.org",
+    r"creativecommons\.org",
+    r"www\.khronos\.org",
+    r"github\.com",
+    r"youtrack",
+    r"hubspotdocuments",
 )
 
+# The app might include many Google internal URLs in libraries and assets, but these are not always app backend API endpoints.
+# We retain a small set of tightly-scoped patterns to keep quality high.
 REAL_API_PATTERNS = (
     r"/api/",
-    r"/v\d+/[a-z]+",  # /v1/users
+    r"/v1/",
+    r"/v2/",
+    r"/v3/",
     r"/graphql",
     r"/oauth",
     r"/auth",
@@ -150,163 +124,136 @@ REAL_API_PATTERNS = (
     r"/users",
     r"/profile",
     r"/account",
-    r"/password",
-    r"/email",
-    r"/phone",
-    r"/verify",
     r"/token",
     r"/refresh",
-    r"/logout",
+    r"/verify",
+    r"/notifications",
     r"/orders",
     r"/payments",
-    r"/transactions",
     r"/products",
-    r"/search",
-    r"/upload",
-    r"/download",
-    r"/notifications",
-    r"/messages",
     r"/comments",
     r"/posts",
     r"/feed",
+    r"/messages",
+    r"/search",
+    r"/upload",
+    r"/download",
     r"/settings",
-    r"/preferences",
 )
 
+# --- Helper functions ---
 
-def is_likely_api_url(value: str) -> bool:
-    """Aggressive false positive filtering."""
-    value = value.strip().strip('"\'')
+def normalize_url(raw: str) -> str:
+    raw = raw.strip().strip('"\'')
+    if not raw:
+        return ""
+    if raw.endswith(("(", ")", "[", "]", "{", "}")):
+        raw = raw.rstrip("()[]{}")
+    return raw
+
+
+def is_likely_api_candidate(value: str) -> bool:
+    value = normalize_url(value)
     if not value:
         return False
 
     lower = value.lower()
-
-    # Reject known external/non-API domains
-    if any(keyword in lower for keyword in IGNORE_KEYWORDS):
+    if not (lower.startswith("http://") or lower.startswith("https://") or lower.startswith("/")):
         return False
 
-    # Reject known false positive patterns
+    # Remove obvious false positives
+    if any(lower.endswith(ext) for ext in SKIP_SUFFIXES):
+        return False
+
     for pattern in FALSE_POSITIVE_PATTERNS:
         if re.search(pattern, lower, re.IGNORECASE):
             return False
 
-    # Only accept if it matches a real API pattern
-    has_api_pattern = any(re.search(pattern, lower) for pattern in REAL_API_PATTERNS)
-    if not has_api_pattern:
+    # Require at least one API-like pattern
+    if not any(re.search(p, lower, re.IGNORECASE) for p in REAL_API_PATTERNS):
         return False
 
-    # Check file extension
-    if any(lower.endswith(ext) for ext in SKIP_SUFFIXES):
-        return False
-
-    # Require either full URL or realistic path
+    # If it's a full URL, make sure it includes a netloc and not a random doc link
     if lower.startswith("http://") or lower.startswith("https://"):
-        parsed = urlparse(value)
-        if not parsed.netloc:
+        try:
+            parsed = urlparse(value)
+            if not parsed.netloc:
+                return False
+        except Exception:
             return False
-        # Extra check: reject paths that look like assets
-        path = parsed.path.lower()
-        if any(path.endswith(ext) for ext in SKIP_SUFFIXES):
+        # Reject weird links with no real hostname component or with a single random token
+        if parsed.netloc.split(".") and len(parsed.netloc.split(".")) == 1 and len(parsed.netloc) < 8:
             return False
-        # Reject single-letter paths like /V1fTq
-        path_parts = [p for p in path.split("/") if p]
-        if len(path_parts) == 1 and len(path_parts[0]) <= 5 and path_parts[0][0].isupper():
-            return False
-        return True
 
-    # path-only fallback - must have API-like structure
-    if value.startswith("/"):
-        path_parts = [p for p in value.split("/") if p]
-        # Reject single-letter or short random-looking parts
-        if len(path_parts) == 1 and len(path_parts[0]) <= 5:
-            return False
-        return True
-
-    return False
+    return True
 
 
-def normalize_raw_url(raw: str) -> str:
-    raw = raw.strip().strip('"\'')
-    if raw.startswith("http://") or raw.startswith("https://"):
-        return raw
-    if raw.startswith("/"):
-        return raw
-    return raw
+def guess_method(url: str) -> str:
+    lower = url.lower()
 
-
-def guess_method(raw_url: str, context: str = "") -> str:
-    url_lower = raw_url.lower()
-    ctx_lower = context.lower()
-    combined = url_lower + " " + ctx_lower
-
-    for key, method in METHOD_HINTS.items():
-        if key in combined:
+    for token, method in METHOD_HINTS.items():
+        if token in lower:
             return method
 
-    path = urlparse(raw_url).path.lower() if raw_url.startswith("http") else raw_url.lower()
-    if any(token in path for token in ("/login", "/signin", "/register", "/signup", "/auth", "/token", "/oauth", "/reset", "/verify", "/upload", "/create", "/post")):
+    if any(k in lower for k in ("/login", "/signin", "/register", "/signup", "/auth", "/token", "/oauth", "/verify", "/refresh", "/upload", "/reset")):
         return "POST"
-    if any(token in path for token in ("/search", "/filter", "/find", "/query", "/fetch", "/get", "/list", "/browse")):
+    if any(k in lower for k in ("/search", "/filter", "/query", "/list", "/download", "/get", "/stats")):
         return "GET"
     return "GET"
 
 
-def scan_text_blob(blob: bytes, context_name: str = "") -> set[str]:
+def scan_blob(blob: bytes) -> set[str]:
     text = blob.decode("utf-8", errors="ignore")
     found: set[str] = set()
 
-    # Full URLs first
+    # Full URL capture first
     for match in URL_RE.findall(text):
-        cleaned = normalize_raw_url(match)
-        if is_likely_api_url(cleaned):
-            found.add(cleaned)
+        candidate = normalize_url(match)
+        if is_likely_api_candidate(candidate):
+            found.add(candidate)
 
-    # Path-like references
+    # Path-like API capture second
     for match in PATH_RE.findall(text):
-        cleaned = normalize_raw_url(match)
-        if is_likely_api_url(cleaned):
-            found.add(cleaned)
+        candidate = normalize_url(match)
+        if is_likely_api_candidate(candidate):
+            found.add(candidate)
 
     return found
 
 
-def extract_from_apk(apk_path: str) -> set[str]:
+def extract_from_zip(apk_path: str) -> set[str]:
     urls: set[str] = set()
-    try:
-        with zipfile.ZipFile(apk_path, "r") as zf:
-            for info in zf.infolist():
-                name_lower = info.filename.lower()
-                if any(name_lower.endswith(s) for s in SKIP_SUFFIXES):
-                    continue
-                try:
-                    with zf.open(info, "r") as fh:
-                        chunk = fh.read(2_000_000)
-                except Exception:
-                    continue
-                if not chunk:
-                    continue
-                urls |= scan_text_blob(chunk, context_name=info.filename)
-    except (zipfile.BadZipFile, Exception):
-        pass
+    with zipfile.ZipFile(apk_path, "r") as zf:
+        for info in zf.infolist():
+            name_lower = info.filename.lower()
+            if any(name_lower.endswith(s) for s in SKIP_SUFFIXES):
+                continue
+            try:
+                with zf.open(info, "r") as fh:
+                    chunk = fh.read(2_000_000)
+            except Exception:
+                continue
+            if not chunk:
+                continue
+            urls |= scan_blob(chunk)
     return urls
 
 
-def decompile_with_jadx(apk_path: str, timeout: int = 120) -> set[str]:
+def decompile_with_jadx(apk_path: str) -> set[str]:
     if shutil.which("jadx") is None:
         return set()
 
     urls: set[str] = set()
-    with tempfile.TemporaryDirectory(prefix="apk_endpoints_") as tmpdir:
+    with tempfile.TemporaryDirectory(prefix="apk_api_extract_") as tmpdir:
         try:
             subprocess.run(
                 ["jadx", "--no-res", "--no-imports", "-d", tmpdir, apk_path],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=timeout,
+                timeout=120,
                 check=False,
             )
-        except (subprocess.TimeoutExpired, OSError):
+        except Exception:
             return set()
 
         for root, _, files in os.walk(tmpdir):
@@ -319,33 +266,26 @@ def decompile_with_jadx(apk_path: str, timeout: int = 120) -> set[str]:
                         data = fh.read(2_000_000)
                 except Exception:
                     continue
-                urls |= scan_text_blob(data, context_name=fn)
+                urls |= scan_blob(data)
     return urls
 
 
-def normalize_output(urls: set[str]) -> list[str]:
-    out: OrderedDict[str, None] = OrderedDict()
+def finalize(urls: set[str]) -> list[str]:
+    result: OrderedDict[str, None] = OrderedDict()
     for raw in sorted(urls):
-        candidate = raw.strip().strip('"\'')
+        candidate = normalize_url(raw)
         if not candidate:
             continue
-        if candidate.startswith("http://") or candidate.startswith("https://"):
-            url = candidate
-            method = guess_method(url)
-            out[f"{method} {url}"] = None
-        elif candidate.startswith("/"):
-            method = guess_method(candidate)
-            out[f"{method} {candidate}"] = None
-
-    return list(out.keys())
+        method = guess_method(candidate)
+        result[f"{method} {candidate}"] = None
+    return list(result.keys())
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Extract real API endpoints from an APK (with false positive filtering).")
-    parser.add_argument("apk", help="Path to the APK file")
-    parser.add_argument("-o", "--output", help="Write results to this file")
+    parser = argparse.ArgumentParser(description="Extract likely API endpoints from an APK file.")
+    parser.add_argument("apk", help="Path to APK file")
+    parser.add_argument("-o", "--output", help="Write output to a file")
     parser.add_argument("--no-jadx", action="store_true", help="Skip jadx decompilation pass")
-    parser.add_argument("--verbose", action="store_true", help="Show filtering details")
     args = parser.parse_args()
 
     apk = args.apk
@@ -353,36 +293,26 @@ def main() -> int:
         print(f"[!] APK not found: {apk}", file=sys.stderr)
         return 1
 
-    if args.verbose:
-        print(f"[*] Scanning APK: {apk}")
-
-    urls = set()
-    urls |= extract_from_apk(apk)
-    
-    if args.verbose:
-        print(f"[*] Found {len(urls)} URL candidates after ZIP scan")
-
+    urls: set[str] = set()
+    urls |= extract_from_zip(apk)
     if not args.no_jadx:
-        jadx_urls = decompile_with_jadx(apk)
-        if jadx_urls and args.verbose:
-            print(f"[*] Found {len(jadx_urls)} additional URL candidates after jadx decompilation")
-        urls |= jadx_urls
+        urls |= decompile_with_jadx(apk)
 
-    final = normalize_output(urls)
+    endpoints = finalize(urls)
 
-    if not final:
-        print("[!] No real API endpoints found in this APK.", file=sys.stderr)
+    if not endpoints:
+        print("[!] No real API endpoints found in this APK.")
         return 0
 
-    print(f"[+] Found {len(final)} API endpoint(s):\n")
-    for line in final:
+    print(f"[+] Found {len(endpoints)} real API endpoint(s):\n")
+    for line in endpoints:
         print(line)
 
     if args.output:
         with open(args.output, "w", encoding="utf-8") as f:
-            for line in final:
+            for line in endpoints:
                 f.write(line + "\n")
-        print(f"\n[+] Results saved to {args.output}")
+        print(f"\n[+] Saved results to {args.output}")
 
     return 0
 
